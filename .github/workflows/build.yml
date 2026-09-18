@@ -1,0 +1,105 @@
+name: Build AllApps Store
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+env:
+  ZSIGN_DEST: AllAppsSigner/Services/Signing/ZSign/zsign
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Clone zsign
+        run: |
+          git clone --depth 1 https://github.com/zhlynn/zsign /tmp/zsign_src
+          ls /tmp/zsign_src/
+
+      - name: Copy zsign sources
+        run: |
+          mkdir -p "$ZSIGN_DEST/common" "$ZSIGN_DEST/mach-o"
+          for f in openssl signing bundle macho archo; do
+            [ -f "/tmp/zsign_src/${f}.h"   ] && cp "/tmp/zsign_src/${f}.h"   "$ZSIGN_DEST/"
+            [ -f "/tmp/zsign_src/${f}.cpp" ] && cp "/tmp/zsign_src/${f}.cpp" "$ZSIGN_DEST/"
+          done
+          [ -d "/tmp/zsign_src/common" ] && cp /tmp/zsign_src/common/*.h   "$ZSIGN_DEST/common/" 2>/dev/null || true
+          [ -d "/tmp/zsign_src/common" ] && cp /tmp/zsign_src/common/*.cpp "$ZSIGN_DEST/common/" 2>/dev/null || true
+          [ -d "/tmp/zsign_src/mach-o"  ] && cp /tmp/zsign_src/mach-o/*    "$ZSIGN_DEST/mach-o/" 2>/dev/null || true
+          find "$ZSIGN_DEST" -type f | sort
+
+      - name: Get latest OpenSSL release
+        id: openssl
+        run: |
+          RELEASE=$(curl -fsSL https://api.github.com/repos/krzyzanowskim/OpenSSL/releases/latest)
+          TAG=$(echo "$RELEASE" | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+          URL=$(echo "$RELEASE" | python3 -c "
+          import sys,json
+          r=json.load(sys.stdin)
+          for a in r.get('assets',[]):
+            n=a['name'].lower()
+            if 'xcframework' in n and n.endswith('.zip'):
+              print(a['browser_download_url']); break
+          " 2>/dev/null || echo "")
+          [ -z "$URL" ] && URL="https://github.com/krzyzanowskim/OpenSSL/releases/download/${TAG}/OpenSSL.xcframework.zip"
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "OpenSSL $TAG → $URL"
+
+      - name: Download OpenSSL.xcframework
+        run: |
+          curl -fsSL "${{ steps.openssl.outputs.url }}" -o /tmp/OpenSSL.zip
+          unzip -q /tmp/OpenSSL.zip -d /tmp/openssl_out/
+          mkdir -p Vendor
+          XCF=$(find /tmp/openssl_out -name "*.xcframework" -maxdepth 3 -type d | head -1)
+          mv "$XCF" Vendor/OpenSSL.xcframework
+          find Vendor/OpenSSL.xcframework -maxdepth 3 -type d | head -10
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build unsigned .app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project AllAppsSigner.xcodeproj \
+            -scheme AllAppsSigner \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            SWIFT_SUPPRESS_WARNINGS=YES \
+            clean build 2>&1 | tee build.log
+          tail -20 build.log
+
+      - name: Package unsigned IPA
+        run: |
+          APP=$(find DerivedData/Build/Products/Release-iphoneos -name "*.app" -type d | head -1)
+          echo "App bundle : $APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r AllAppsStore-unsigned.ipa Payload/
+          ls -lh AllAppsStore-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AllAppsStore-unsigned-ipa
+          path: AllAppsStore-unsigned.ipa
+          retention-days: 30
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
