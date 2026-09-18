@@ -1,0 +1,348 @@
+name: Compile IPA
+
+on:
+  repository_dispatch:
+    types: [build_ipa]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+
+    env:
+      BUILD_ID:      ${{ github.event.client_payload.build_id }}
+      RELEASE_ID:    ${{ github.event.client_payload.release_id }}
+      ASSET_ID:      ${{ github.event.client_payload.asset_id }}
+      USER_SCHEME:   ${{ github.event.client_payload.scheme }}
+      CONFIGURATION: ${{ github.event.client_payload.configuration }}
+      GH_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+      REPO:          ${{ github.repository }}
+
+    steps:
+
+      - name: Select Xcode 26
+        # Le SEUL changement indispensable pour le vrai Liquid Glass iOS 26 : le
+        # runner passe de macos-15 (Xcode 16, pas d'UI iOS 26) à macos-26. Le SDK
+        # iOS 26 active alors automatiquement la tab bar flottante « en bulles »
+        # et le reste du Liquid Glass — le code SwiftUI ne bouge pas, la cible
+        # reste iOS 17, les anciens iPhone continuent d'installer normalement.
+        # Recherche dynamique (au lieu d'un chemin figé Xcode_26.app) : le nom
+        # exact du dossier varie selon la version mineure (Xcode_26.0.app,
+        # Xcode_26.1.app…) et je ne veux pas re-casser ce build à cause de ça.
+        run: |
+          XCODE_PATH=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XCODE_PATH" ]; then
+            echo "Xcode 26 introuvable sur ce runner. Xcode disponibles :" >&2
+            ls /Applications | grep -i xcode >&2 || true
+            echo "ERREUR : ce runner n'a pas Xcode 26 — le Liquid Glass ne sera pas actif." >&2
+            exit 1
+          fi
+          echo "Xcode sélectionné : $XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+
+      - name: Download project ZIP
+        run: |
+          echo "Build #$BUILD_ID â release $RELEASE_ID â asset $ASSET_ID"
+          curl -fsSL \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            "https://api.github.com/repos/$REPO/releases/assets/$ASSET_ID" \
+            -o project.zip
+          echo "Taille : $(du -sh project.zip | cut -f1)"
+
+      - name: Extract & detect project
+        id: detect
+        run: |
+          mkdir -p project_src
+          unzip -q project.zip -d project_src/
+          echo "=== Structure (3 niveaux) ==="
+          find project_src -maxdepth 3 | head -50
+
+          MARKER=$(find project_src -maxdepth 5 \
+            \( \( -name "project.yml"   -type f \) \
+            -o \( -name "Podfile"       -type f \) \
+            -o \( -name "*.xcworkspace" -type d \) \
+            -o \( -name "*.xcodeproj"   -type d \) \
+            \) \
+            ! -path "*/Pods/*" ! -path "*/.git/*" ! -path "*/node_modules/*" \
+            2>/dev/null | sort | head -1)
+
+          if [ -z "$MARKER" ]; then
+            echo "ERREUR : aucun projet Xcode trouvÃ© dans le ZIP" >&2; exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$MARKER")
+          echo "project_dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
+          echo "RÃ©pertoire projet : $PROJECT_DIR"
+          ls "$PROJECT_DIR"
+
+      - name: Extra dependencies (OpenSSL + zsign + mGBA)
+        run: |
+          DIR="${{ steps.detect.outputs.project_dir }}"
+
+          # ââ OpenSSL.xcframework ââââââââââââââââââââââââââââââââââââââââââ
+          if [ -f "$DIR/project.yml" ] && grep -q "OpenSSL" "$DIR/project.yml" 2>/dev/null \
+             && [ ! -d "$DIR/Vendor/OpenSSL.xcframework" ]; then
+            echo "=== OpenSSL.xcframework ==="
+            RELEASE=$(curl -fsSL https://api.github.com/repos/krzyzanowskim/OpenSSL/releases/latest)
+            TAG=$(echo "$RELEASE" | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+            URL=$(echo "$RELEASE" | python3 -c "
+          import sys,json
+          r=json.load(sys.stdin)
+          for a in r.get('assets',[]):
+            n=a['name'].lower()
+            if 'xcframework' in n and n.endswith('.zip'):
+              print(a['browser_download_url']); break
+          " 2>/dev/null || echo "")
+            [ -z "$URL" ] && URL="https://github.com/krzyzanowskim/OpenSSL/releases/download/${TAG}/OpenSSL.xcframework.zip"
+            echo "OpenSSL $TAG -> $URL"
+            curl -fsSL "$URL" -o /tmp/OpenSSL.zip
+            unzip -q /tmp/OpenSSL.zip -d /tmp/openssl_out/
+            mkdir -p "$DIR/Vendor"
+            XCF=$(find /tmp/openssl_out -name "*.xcframework" -maxdepth 3 -type d | head -1)
+            mv "$XCF" "$DIR/Vendor/OpenSSL.xcframework"
+            echo "OK OpenSSL installe"
+          else
+            echo "OpenSSL : non requis ou deja present"
+          fi
+
+          # ââ zsign ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+          ZSIGN_BRIDGE=$(find "$DIR" \( -name "ZSignBridge.mm" -o -name "ZSignBridge.h" \) \
+            2>/dev/null | head -1)
+
+          if [ -n "$ZSIGN_BRIDGE" ]; then
+            ZSIGN_DIR=$(dirname "$ZSIGN_BRIDGE")
+            if [ -f "$DIR/project.yml" ] && grep -qE "ZSIGN_ENABLED.*0" "$DIR/project.yml" 2>/dev/null; then
+              echo "ZSIGN_ENABLED: 0 - zsign ignore"
+              ZSIGN_BRIDGE=""
+            fi
+          fi
+
+          if [ -n "$ZSIGN_BRIDGE" ]; then
+            ZSIGN_DIR=$(dirname "$ZSIGN_BRIDGE")
+            if [ ! -d "$ZSIGN_DIR/zsign" ] || [ -z "$(ls -A "$ZSIGN_DIR/zsign" 2>/dev/null)" ]; then
+              echo "=== Clonage zsign ==="
+              git clone --depth 1 https://github.com/zhlynn/zsign /tmp/zsign_src
+              mkdir -p "$ZSIGN_DIR/zsign/common" "$ZSIGN_DIR/zsign/mach-o"
+              if [ -d /tmp/zsign_src/src ]; then
+                SRC="/tmp/zsign_src/src"
+              else
+                SRC="/tmp/zsign_src"
+              fi
+              find "$SRC" -maxdepth 1 -type f \( -name "*.h" -o -name "*.cpp" \) \
+                ! -name "zsign.cpp" -exec cp {} "$ZSIGN_DIR/zsign/" \;
+              [ -d "$SRC/common" ] && \
+                find "$SRC/common" -type f \( -name "*.h" -o -name "*.cpp" \) \
+                  -exec cp {} "$ZSIGN_DIR/zsign/common/" \; || true
+              [ -d "$SRC/mach-o" ] && \
+                cp "$SRC/mach-o/"* "$ZSIGN_DIR/zsign/mach-o/" 2>/dev/null || true
+            fi
+            if [ ! -f "$ZSIGN_DIR/zsign/openssl.h" ]; then
+              if [ -f "$DIR/project.yml" ]; then
+                sed -i '' 's/ZSIGN_ENABLED:.*1/ZSIGN_ENABLED: 0/' "$DIR/project.yml" 2>/dev/null || \
+                sed -i    's/ZSIGN_ENABLED:.*1/ZSIGN_ENABLED: 0/' "$DIR/project.yml" 2>/dev/null || true
+              fi
+            else
+              echo "OK zsign pret"
+            fi
+          else
+            echo "zsign : non requis"
+          fi
+
+          # ââ mGBA (declenche par mgba_config.yml) ââââââââââââââââââââââââ
+          if [ -f "$DIR/mgba_config.yml" ]; then
+            echo "=== Installation mGBA ==="
+
+            MGBA_TAG=$(grep "mgba_version:" "$DIR/mgba_config.yml" 2>/dev/null \
+              | awk '{print $2}' | tr -d '"' | tr -d "'" | xargs)
+            MGBA_TAG="${MGBA_TAG:-0.10.3}"
+            echo "Version mGBA cible : $MGBA_TAG"
+
+            git clone --depth 1 --branch "$MGBA_TAG" \
+              https://github.com/mgba-emu/mgba.git /tmp/mgba_src 2>&1 | tail -3 || \
+            git clone --depth 1 \
+              https://github.com/mgba-emu/mgba.git /tmp/mgba_src 2>&1 | tail -3
+
+            MGBA_DEST="$(cd "$DIR" && pwd)/Vendor/mgba"
+            mkdir -p \
+              "$MGBA_DEST/src/arm" \
+              "$MGBA_DEST/src/core" \
+              "$MGBA_DEST/src/gba/renderers" \
+              "$MGBA_DEST/src/util" \
+              "$MGBA_DEST/src/platform/posix" \
+              "$MGBA_DEST/include/mgba/core"
+
+            # Copier les headers mGBA
+            [ -d /tmp/mgba_src/include ] && \
+              cp -r /tmp/mgba_src/include/. "$MGBA_DEST/include/" 2>/dev/null || true
+
+            # Generer mgba-config.h via python3 (evite les problemes heredoc YAML)
+            printf '%s\n' \
+              '#pragma once' \
+              '#ifndef MGBA_CONFIG_H' \
+              '#define MGBA_CONFIG_H' \
+              '#define MGBA_VERSION "0.10.3"' \
+              '#define MGBA_VERSION_MAJOR 0' \
+              '#define MGBA_VERSION_MINOR 10' \
+              '#define MGBA_VERSION_PATCH 3' \
+              '#define GBA_ONLY 1' \
+              '#define DISABLE_THREADING 1' \
+              '#define MINIMAL_GBA 1' \
+              '#define NO_DEBUGGER 1' \
+              '#define HAVE_LOCALE 1' \
+              '#define HAVE_STRNDUP 1' \
+              '#define HAVE_STRDUP 1' \
+              '#define HAVE_LOCALTIME_R 1' \
+              '#endif' \
+              > "$MGBA_DEST/include/mgba-config.h"
+            # Ne PAS Ã©craser mgba/core/config.h (la vraie version vient du clone mGBA)
+            echo "OK config headers generes"
+
+            # Copier les sources C
+            [ -d /tmp/mgba_src/src/arm ] && \
+              cp /tmp/mgba_src/src/arm/*.c "$MGBA_DEST/src/arm/" 2>/dev/null || true
+
+            for F in core.c log.c serialize.c cache-set.c cheats.c; do
+              SRC_F="/tmp/mgba_src/src/core/$F"
+              [ -f "$SRC_F" ] && cp "$SRC_F" "$MGBA_DEST/src/core/" 2>/dev/null || true
+            done
+
+            # Copier headers (nÃ©cessaires pour GBAEmulatorBridge.mm)
+            cd /tmp/mgba_src && find src -name "*.h" | while IFS= read -r f; do
+              dest="$MGBA_DEST/$f"
+              mkdir -p "$(dirname $dest)"
+              cp "$f" "$dest" 2>/dev/null || true
+            done
+            echo "OK headers mGBA copies"
+
+            # Compiler mGBA directement en static library libmgba.a
+            echo "=== Compilation libmgba.a ==="
+            SDK=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
+            MGBA_INC="-I$MGBA_DEST/include -I$MGBA_DEST/src"
+            MGBA_DEF="-DHAVE_STRLCPY=1 -DHAVE_STRLCAT=1 -DHAVE_STRNDUP=1 -DHAVE_STRDUP=1 -DHAVE_LOCALTIME_R=1 -DHAVE_LOCALE=1 -DGBA_ONLY=1 -DDISABLE_THREADING=1 -DMINIMAL_GBA=1 -DNO_DEBUGGER=1 -DMGBA_VERSION_MAJOR=0 -DMGBA_VERSION_MINOR=10 -DMGBA_VERSION_PATCH=3"
+            mkdir -p "$MGBA_DEST/build" "$MGBA_DEST/lib"
+            NOBJ=0
+            find /tmp/mgba_src/src -name "*.c" ! -path "*/test*" ! -path "*/tools*" ! -path "*/platform/*" ! -path "*/platform/qt*" ! -path "*/platform/sdl*" | while IFS= read -r f; do
+              rel="${f#/tmp/mgba_src/src/}"
+              obj="$MGBA_DEST/build/${rel//\//_}.o"
+              if clang -c -arch arm64 -isysroot "$SDK" -mios-version-min=16.0                    $MGBA_INC $MGBA_DEF -O2 -w "$f" -o "$obj" 2>/dev/null; then
+                echo "$obj"
+              fi
+            done > "$MGBA_DEST/build/objects.txt"
+            NB_OBJ=$(wc -l < "$MGBA_DEST/build/objects.txt" | tr -d ' ')
+            echo "CompilÃ©s : $NB_OBJ fichiers"
+            if [ "$NB_OBJ" -gt 0 ]; then
+              xargs libtool -static -o "$MGBA_DEST/lib/libmgba.a" < "$MGBA_DEST/build/objects.txt"
+              echo "OK libmgba.a : $(du -sh $MGBA_DEST/lib/libmgba.a | cut -f1)"
+            else
+              echo "ERREUR: aucun fichier compilÃ©"
+            fi
+
+            NB_C=$(find "$MGBA_DEST/src" -name "*.c" 2>/dev/null | wc -l | tr -d ' ')
+            NB_H=$(find "$MGBA_DEST/src" -name "*.h" 2>/dev/null | wc -l | tr -d ' ')
+            echo "OK mGBA installe : $NB_C fichiers C, $NB_H headers"
+          else
+            echo "mGBA : mgba_config.yml absent, non requis"
+          fi
+
+      - name: CocoaPods
+        run: |
+          DIR="${{ steps.detect.outputs.project_dir }}"
+          if [ -f "$DIR/Podfile" ]; then
+            cd "$DIR" && pod install --repo-update
+          else
+            echo "Pas de Podfile â skipping"
+          fi
+
+      - name: XcodeGen
+        run: |
+          DIR="${{ steps.detect.outputs.project_dir }}"
+          if [ -f "$DIR/project.yml" ]; then
+            brew install xcodegen
+            cd "$DIR" && xcodegen generate
+            echo "Contenu apres XcodeGen :"; ls
+          else
+            echo "Pas de project.yml â skipping"
+          fi
+
+      - name: Detect scheme
+        id: scheme
+        run: |
+          DIR="${{ steps.detect.outputs.project_dir }}"
+          SCHEME="$USER_SCHEME"
+          if [ -n "$SCHEME" ]; then
+            echo "Scheme fourni : $SCHEME"
+          else
+            XCWORKSPACE=$(find "$DIR" -maxdepth 1 -name "*.xcworkspace" -type d \
+              ! -name "*.xcodeproj" 2>/dev/null | head -1)
+            XCODEPROJ=$(find "$DIR" -maxdepth 1 -name "*.xcodeproj" -type d 2>/dev/null | head -1)
+            if [ -n "$XCWORKSPACE" ]; then
+              LIST_ARG="-workspace $XCWORKSPACE"; PROJ="$XCWORKSPACE"
+            elif [ -n "$XCODEPROJ" ]; then
+              LIST_ARG="-project $XCODEPROJ"; PROJ="$XCODEPROJ"
+            else
+              echo "ERREUR : aucun projet" >&2; exit 1
+            fi
+            SCHEME=$(xcodebuild -list $LIST_ARG 2>/dev/null \
+              | awk '/Schemes:/,/^[[:space:]]*$/' \
+              | grep -v "Schemes:" | head -1 | xargs || echo "")
+            [ -z "$SCHEME" ] && SCHEME=$(basename "$PROJ" | sed 's/\..*//')
+            echo "Scheme : $SCHEME"
+          fi
+          echo "scheme=$SCHEME" >> $GITHUB_OUTPUT
+
+      - name: Build
+        run: |
+          DIR="${{ steps.detect.outputs.project_dir }}"
+          SCHEME="${{ steps.scheme.outputs.scheme }}"
+          CONF="${{ env.CONFIGURATION }}"
+          [ -z "$CONF" ] && CONF="Release"
+          XCWORKSPACE=$(find "$DIR" -maxdepth 1 -name "*.xcworkspace" -type d \
+            ! -name "*.xcodeproj" 2>/dev/null | head -1)
+          XCODEPROJ=$(find "$DIR" -maxdepth 1 -name "*.xcodeproj" -type d 2>/dev/null | head -1)
+          if [ -n "$XCWORKSPACE" ]; then PROJ_ARG="-workspace $XCWORKSPACE"
+          elif [ -n "$XCODEPROJ" ]; then PROJ_ARG="-project $XCODEPROJ"
+          else echo "ERREUR : aucun projet" >&2; exit 1; fi
+          echo "=== $PROJ_ARG -scheme $SCHEME -configuration $CONF ==="
+          set -o pipefail
+          xcodebuild $PROJ_ARG -scheme "$SCHEME" -configuration "$CONF" \
+            -sdk iphoneos -derivedDataPath DerivedData \
+            CODE_SIGNING_ALLOWED=NO SWIFT_SUPPRESS_WARNINGS=YES \
+            clean build 2>&1 | tee build.log
+
+      - name: Package IPA
+        run: |
+          APP=$(find DerivedData -name "*.app" -type d \
+            ! -path "*simulator*" ! -path "*iphonesimulator*" 2>/dev/null | head -1)
+          [ -z "$APP" ] && APP=$(find DerivedData -name "*.app" -type d 2>/dev/null | head -1)
+          mkdir -p Payload && cp -R "$APP" Payload/
+          IPA="build_${BUILD_ID}.ipa"
+          zip -r "$IPA" Payload/ && ls -lh "$IPA"
+          echo "IPA=$IPA" >> $GITHUB_ENV
+
+      - name: Upload IPA to release
+        run: |
+          HTTP=$(curl -fsSL -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: application/zip" \
+            --write-out "%{http_code}" --output /dev/null \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$IPA" \
+            --data-binary @"$IPA")
+          echo "HTTP $HTTP"
+          [ "$HTTP" = "201" ] && echo "OK IPA uploade" || (echo "ERREUR HTTP $HTTP" && exit 1)
+
+      - name: Upload error log on failure
+        if: failure()
+        run: |
+          LOG="build_${BUILD_ID}.failed.log"
+          if [ -f build.log ] && [ -s build.log ]; then tail -400 build.log > "$LOG"
+          else echo "Log vide" > "$LOG"; find . -maxdepth 4 | head -40 >> "$LOG"; fi
+          tail -20 "$LOG"
+          curl -fsSL -X POST -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --write-out "HTTP %{http_code}\n" --output /dev/null \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$LOG" \
+            --data-binary @"$LOG"
