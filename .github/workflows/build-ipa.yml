@@ -248,6 +248,55 @@ jobs:
             echo "mGBA : mgba_config.yml absent, non requis"
           fi
 
+      - name: Extra dependency (TDLib, arm64 uniquement)
+        # Jamais exécutée avant — première tentative, à corriger avec les logs si ça
+        # échoue. Compile UNIQUEMENT en arm64 (appareil réel, pas de simulateur) pour
+        # garder la taille au minimum, et désactive tout ce qui touche aux appels/VoIP
+        # (jamais utilisé ici : on ne fait que lister des groupes et télécharger des
+        # fichiers). TDLib compile son propre OpenSSL en interne (build-openssl.sh) —
+        # différent de Vendor/OpenSSL.xcframework déjà utilisé par zsign, aucun moyen
+        # simple de les faire partager sans toucher au CMake de TDLib.
+        run: |
+          DIR="${{ steps.detect.outputs.project_dir }}"
+          if [ -f "$DIR/project.yml" ] && grep -q "TDLib" "$DIR/project.yml" 2>/dev/null \
+             && [ ! -d "$DIR/Vendor/TDLib" ]; then
+            echo "=== Clonage TDLib ==="
+            git clone --depth 1 --recursive https://github.com/tdlib/td.git /tmp/td_src
+
+            echo "=== Outils requis (gperf, php si absents) ==="
+            brew list gperf &>/dev/null || brew install gperf
+            brew list php   &>/dev/null || brew install php
+
+            echo "=== Récupération/compilation d'OpenSSL pour TDLib (arm64 iOS) ==="
+            (cd /tmp/td_src/example/ios && sh build-openssl.sh)
+
+            echo "=== Compilation TDLib (arm64 iOS device uniquement) ==="
+            OPENSSL_ROOT_DIR="/tmp/td_src/example/ios/third_party/openssl/iOS"
+            mkdir -p /tmp/td_build && cd /tmp/td_build
+            cmake /tmp/td_src \
+              -DCMAKE_TOOLCHAIN_FILE=/tmp/td_src/CMake/iOS.cmake \
+              -DIOS_PLATFORM=OS64 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DTD_ENABLE_DOTNET=OFF \
+              -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+              -DOPENSSL_INCLUDE_DIR="$OPENSSL_ROOT_DIR/include" \
+              -DOPENSSL_CRYPTO_LIBRARY="$OPENSSL_ROOT_DIR/lib/libcrypto.a" \
+              -DOPENSSL_SSL_LIBRARY="$OPENSSL_ROOT_DIR/lib/libssl.a"
+            cmake --build . --target tdjson_static --config Release -- -j$(sysctl -n hw.ncpu)
+
+            echo "=== Rassemblement dans Vendor/TDLib ==="
+            DEST="$(cd "$DIR" && pwd)/Vendor/TDLib"
+            mkdir -p "$DEST/lib" "$DEST/include"
+            find /tmp/td_build -name "*.a" -exec cp {} "$DEST/lib/" \;
+            cp /tmp/td_src/td/telegram/td_json_client.h "$DEST/include/" 2>/dev/null || true
+            cp /tmp/td_src/td/tl/tl_json.h "$DEST/include/" 2>/dev/null || true
+
+            echo "OK TDLib : $(du -sh "$DEST" | cut -f1) au total"
+            du -h "$DEST"/lib/*.a 2>/dev/null | sort -rh
+          else
+            echo "TDLib : non requis ou deja present"
+          fi
+
       - name: CocoaPods
         run: |
           DIR="${{ steps.detect.outputs.project_dir }}"
